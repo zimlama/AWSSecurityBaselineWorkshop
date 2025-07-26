@@ -1,0 +1,397 @@
+#MIT No Attribution
+#Copyright 2024 Amazon Web Services
+##Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so.
+## THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### Single CFN template that will deploy the foundational baseline security controls.
+## This includes 1/ Creating an IAM Admin User, 2/ turning CloudTrail on, 3/ Blocking public access to S3, 4/ Setting up billing and root account use alarms, 5/ Enabling GuardDuty
+# This is not production ready code. Please review the code before deploying into a production account.
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Security Baseline Workshop
+  
+Parameters:
+## Check with optional things the user wants to deploy
+  ShouldDeployCloudTrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Set to 'false' if you have already deployed a CloudTrail trail. If false (not deploying CloudTrail Trail), you will need to deploy the root account alarm manually"
+
+  ShouldDeployOrganizations:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Set to 'false' if you have already deployed an AWS Organization"
+
+  GuardDutyDeploy:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Set to 'false' if you do not want to deploy GuardDuty. GuardDuty has a 30 day free trial before you will incur charges."
+
+  AdminUserDeploy:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Set to 'false' if you do not want to deploy an IAM Admin User. This could be because you already have one or use IAM Identity Center."
+
+## Parameters for IAM admin user
+  AdminUserName:
+    Type: String
+    Description: "[Optional] IAM Admin User Name. A best practice is to tie this to a single person with a specific user name like 'kevin-admin'."
+    Default: "AdminUser"
+
+  AdminUserPassword:
+    Type: String
+    NoEcho: true
+    Description: "[Optional] IAM Admin User password. Leave blank if you are not deploying an IAM Admin User. The password should have at least one uppercase letter, one number, and one symbol. The user will be required to reset the password after their first login. Save this somewhere safe so that you can use it to sign in to the user later. Remember to set up MFA after logging in."
+    MaxLength: '32'
+    ## This regex allows blank values for situations where the user chooses not to deploy an admin user.
+    AllowedPattern: '^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()-_+=]).*|^$'
+    # ConstraintDescription: 'Password must contain at least 8 characters with a capital letter, a number, and a symbol.'
+
+## Parameters for alarms
+  EmailRecipient:
+    Type: String
+    Default: "example@example.com"
+    Description: "[Mandatory] Email address to receive root account use and billing alerts."
+
+  BillingThreshold:
+    Type: Number
+    Default: 100.0
+    Description: "[Mandatory] Amount (in USD) to trigger billing alert. This should be 10% greater than your usual monthly spend."
+
+## Parameters for GuardDuty
+  GuardDutyEmailRecipient:
+    Type: String
+    Default: "example@example.com"
+    Description: "[Optional] Email address to receive alerts for medium and high GuardDuty findings. Ignore if you are not activating GuardDuty and set ShouldDeployGuardDuty to false."
+
+### Conditions as to what to deploy
+Conditions:
+  Should-deploy-CloudTrail: !Equals [ !Ref ShouldDeployCloudTrail, "true" ]
+  ShouldDeployOrganizations: !Equals [ !Ref ShouldDeployOrganizations, "true" ]
+  ShouldDeployGuardDuty: !Equals [ !Ref GuardDutyDeploy, "true" ]
+  ShouldDeployIAMUser: !Equals [ !Ref AdminUserDeploy, "true" ]
+
+Resources:
+### Deploy a billing alarm
+  Budget:
+    Type: "AWS::Budgets::Budget"
+    Properties:
+      Budget:
+        BudgetName: "BillingBudget"
+        BudgetType: "COST"
+        TimeUnit: "MONTHLY"
+        BudgetLimit:
+          Amount: !Ref BillingThreshold
+          Unit: "USD"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: "ACTUAL"
+            ComparisonOperator: "GREATER_THAN"
+            Threshold: !Ref BillingThreshold
+            ThresholdType: "PERCENTAGE"
+          Subscribers:
+            - SubscriptionType: "EMAIL"
+              Address: !Ref EmailRecipient
+
+### Deploy CloudTrail trail and root account use alarm
+  CloudTrail:
+    Type: "AWS::CloudTrail::Trail"
+    Condition: Should-deploy-CloudTrail
+    Properties:
+      TrailName: "ManagementEventsTrail"
+      IsLogging: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: "All"
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      S3BucketName:
+        Ref: "S3BucketForCloudTrailCloudTrail"
+      CloudWatchLogsLogGroupArn: 
+        Fn::GetAtt:
+          - "RootAlarmLogGroup"
+          - "Arn"
+      CloudWatchLogsRoleArn:
+        Fn::GetAtt:
+          - "IamRoleForCwLogsCloudTrail"
+          - "Arn"
+    DependsOn: "S3BucketPolicy"
+  S3BucketForCloudTrailCloudTrail:
+    Type: "AWS::S3::Bucket"
+    Condition: Should-deploy-CloudTrail
+    Properties: 
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: KMS-KEY-ARN
+            BucketKeyEnabled: true
+      LoggingConfiguration:
+        LogFilePrefix: cloudtrail-logs
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Condition: Should-deploy-CloudTrail
+    Properties:
+      Bucket:
+        Ref: "S3BucketForCloudTrailCloudTrail"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AWSCloudTrailBucketPermissionsCheck"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "cloudtrail.amazonaws.com"
+            Action: "s3:GetBucketAcl"
+            Resource:
+              Fn::GetAtt:
+                - "S3BucketForCloudTrailCloudTrail"
+                - "Arn"
+          - Sid: " AWSConfigBucketDelivery"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "cloudtrail.amazonaws.com"
+            Action: "s3:PutObject"
+            Resource:
+              Fn::Join:
+                - ""
+                -
+                  - Fn::GetAtt:
+                    - "S3BucketForCloudTrailCloudTrail"
+                    - "Arn"
+                  - "/AWSLogs/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+  IamRoleForCwLogsCloudTrail:
+    Type: "AWS::IAM::Role"
+    Condition: Should-deploy-CloudTrail
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "allow-access-to-cw-logs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: 
+                  Fn::GetAtt:
+                    - "RootAlarmLogGroup"
+                    - "Arn"
+  RootAlarmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: Should-deploy-CloudTrail
+    Properties:
+      LogGroupName: "cloud-watch-root-account-use-alarm"
+      RetentionInDays: 365
+  SnsTopicMetricFilterCloudWatchAlarm:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailRecipient
+          Protocol: "email"
+      TopicName: "RootAccountUseTopic"
+  CloudWatchAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: "A CloudWatch Alarm that triggers if a root user uses the account."
+      MetricName: "RootUserEventCount"
+      Namespace: "CloudTrailMetrics"
+      Statistic: "Sum"
+      Period: "60"
+      EvaluationPeriods: "1"
+      Threshold: "1"
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - Ref: "SnsTopicMetricFilterCloudWatchAlarm"
+      TreatMissingData: "notBreaching"
+  MetricFilterCloudWatchAlarm:
+    Type: "AWS::Logs::MetricFilter"
+    Properties:
+      LogGroupName: "cloud-watch-root-account-use-alarm"
+      FilterPattern: "{ ($.userIdentity.type = \"Root\") && ($.userIdentity.invokedBy NOT EXISTS) && ($.eventType != \"AwsServiceEvent\") }"
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: "CloudTrailMetrics"
+          MetricName: "RootUserEventCount"
+    DependsOn: RootAlarmLogGroup
+
+### Deploy Admin IAM User and Group
+  AdminIAMGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      ManagedPolicyArns: 
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+  AdminIAMUser:
+    Type: 'AWS::IAM::User'
+    Condition: ShouldDeployIAMUser
+    Properties:
+      UserName: !Ref AdminUserName
+      LoginProfile:
+        Password: !Ref AdminUserPassword
+        PasswordResetRequired: true
+      Groups: 
+        - !Ref AdminIAMGroup
+
+### Deploy AWS Organizations 
+  MyOrganization:
+    Type: AWS::Organizations::Organization
+    Condition: ShouldDeployOrganizations
+    Properties:
+      FeatureSet: ALL
+
+### Deploy GuardDuty and SNS notifications
+  EnableGuardDuty:
+    Type: AWS::GuardDuty::Detector
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      Enable: true
+
+  GuardDutySNSTopic:
+    Type: "AWS::SNS::Topic"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      DisplayName: "GuardDutySNSTopic"
+      TopicName: "GuardDutySNSTopic"
+  
+  GuardDutySNSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      Protocol: "email"
+      TopicArn: !Ref GuardDutySNSTopic
+      Endpoint: !Ref GuardDutyEmailRecipient
+
+  GuardDutySNSTopicPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Id: "__default_policy_ID"
+        Statement:
+          - Sid: "__default_statement_ID"
+            Effect: "Allow"
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - "SNS:GetTopicAttributes"
+              - "SNS:SetTopicAttributes"
+              - "SNS:AddPermission"
+              - "SNS:RemovePermission"
+              - "SNS:DeleteTopic"
+              - "SNS:Subscribe"
+              - "SNS:ListSubscriptionsByTopic"
+              - "SNS:Publish"
+            Resource: !Ref GuardDutySNSTopic
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref "AWS::AccountId"
+          - Sid: "AWSEvents_GuardDutyNotification"
+            Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref GuardDutySNSTopic
+      Topics: 
+        - !Ref GuardDutySNSTopic
+  
+  GuardDutyCloudWatchLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      LogGroupName: "/aws/events/GuardDuty"
+      RetentionInDays: 365
+
+  GuardDutyDeliveryEventRule:
+    Type: "AWS::Events::Rule"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - "GuardDuty Finding"
+      State: "ENABLED"
+      Targets:
+        - Arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${GuardDutyCloudWatchLogGroup}"
+          Id: GuardDutyCloudWatchLogGroupTarget
+    DependsOn: GuardDutyCloudWatchLogGroup
+
+  GuardDutyEventRuleSNS:
+    Type: "AWS::Events::Rule"
+    Condition: ShouldDeployGuardDuty
+    Properties:
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - 7
+            - 7.0
+            - 7.1
+            - 7.2
+            - 7.3
+            - 7.4
+            - 7.5
+            - 7.6
+            - 7.7
+            - 7.8
+            - 7.9
+            - 8
+            - 8.0
+            - 8.1
+            - 8.2
+            - 8.3
+            - 8.4
+            - 8.5
+            - 8.6
+            - 8.7
+            - 8.8
+            - 8.9
+            - 9
+            - 9.0
+      State: "ENABLED"
+      Targets:
+        - Arn: !Ref GuardDutySNSTopic
+          Id: GuardDutySNSTopicTarget
+          InputTransformer:
+            InputPathsMap:
+              account: "$.account"
+              arn: "$.detail.arn"
+              description: "$.detail.description"
+              findingID: "$.detail.id"
+              firstSeen: "$.detail.service.eventFirstSeen"
+              region: "$.region"
+              severity: "$.detail.severity"
+              title: "$.detail.title"
+              type: "$.detail.type"
+            InputTemplate: |
+              "You have a severity <severity> GuardDuty finding type <type>\nRegion: <region>\nAccount: <account>\nFirst seen: <firstSeen>\nARN: <arn>\nFinding Description:\n<description>\nLink to GuardDuty console: https://console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingID>"
+    DependsOn: GuardDutySNSTopic
+
+Outputs:
+## These outputs should help customers access what they did more easily.
+  IAMSignInURL:
+    Description: 'IAM User Sign-In URL'
+    Value: !Sub 'https://${AWS::AccountId}.signin.aws.amazon.com/console'
